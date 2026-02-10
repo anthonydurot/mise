@@ -3,7 +3,7 @@ use crate::backend::platform_target::PlatformTarget;
 use crate::backend::{Backend, VersionInfo};
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
-use crate::cmd::CmdLineRunner;
+use crate::cmd::{CmdLineRunner, cmd};
 use crate::config::{Config, Settings};
 use crate::env;
 use crate::file;
@@ -521,27 +521,27 @@ impl PIPXBackend {
             auth_args.len()
         );
 
-        // Clone values for the async closure
-        let package = package.to_string();
+        // Clone values for the async closure and later error messages
+        let package_name = package.to_string();
         let auth_args = auth_args.clone();
 
         // Execute pip index versions with timeout to prevent hanging
         let stdout = timeout::run_with_timeout_async(
             async move || {
                 // Build command: pip index versions <package> <auth_args...>
-                let mut cmd = CmdLineRunner::new("pip");
-                cmd = cmd.arg("index").arg("versions").arg(&package);
+                let mut cmd_args = vec![
+                    "index".to_string(),
+                    "versions".to_string(),
+                    package_name.clone(),
+                ];
+                cmd_args.extend(auth_args);
 
-                // Add authentication arguments (e.g., --extra-index-url, --keyring-provider)
-                for arg in &auth_args {
-                    cmd = cmd.arg(arg);
-                }
-
-                cmd.read().wrap_err_with(|| {
+                // Use cmd() function to build Expression for command execution
+                cmd("pip", cmd_args).read().wrap_err_with(|| {
                     format!(
                         "Failed to execute pip index versions for {}. \
                              Ensure pip is installed and accessible in PATH.",
-                        package
+                        package_name
                     )
                 })
             },
