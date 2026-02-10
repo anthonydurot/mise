@@ -844,87 +844,66 @@ fn fix_venv_python_symlink(_install_path: &Path, _pkg_name: &str) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::args::BackendArg;
+    use crate::cli::args::{BackendArg, BackendResolution};
 
     fn create_test_backend() -> PIPXBackend {
-        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
-        PIPXBackend {
-            ba,
-            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
-        }
+        let ba = BackendArg::new_raw(
+            "pipx:test-package".to_string(),
+            Some("pipx:test-package".to_string()),
+            "test-package".to_string(),
+            None,
+            BackendResolution::new(true),
+        );
+        PIPXBackend::from_arg(ba)
+    }
+
+    fn create_backend_with_opts(opts: &[(&str, &str)]) -> PIPXBackend {
+        let ba = BackendArg::new_raw(
+            "pipx:test-package".to_string(),
+            Some("pipx:test-package".to_string()),
+            "test-package".to_string(),
+            {
+                let mut map = BTreeMap::new();
+                for (k, v) in opts {
+                    map.insert(k.to_string(), v.to_string());
+                }
+                if map.is_empty() { None } else { Some(map) }
+            },
+            BackendResolution::new(true),
+        );
+        PIPXBackend::from_arg(ba)
     }
 
     #[test]
     fn test_is_private_registry_with_extra_index_url() {
-        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
-        let mut backend = PIPXBackend {
-            ba: ba.clone(),
-            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
-        };
-
-        // Test with --extra-index-url
-        backend.ba = Arc::new({
-            let mut ba = (*ba).clone();
-            ba.with_option(
-                "uvx_args",
-                "--extra-index-url https://pypi.example.com/simple/",
-            );
-            ba
-        });
+        let backend = create_backend_with_opts(&[(
+            "uvx_args",
+            "--extra-index-url https://pypi.example.com/simple/",
+        )]);
         assert!(backend.is_private_registry());
     }
 
     #[test]
     fn test_is_private_registry_with_index_url() {
-        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
-        let mut backend = PIPXBackend {
-            ba: ba.clone(),
-            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
-        };
-
-        // Test with --index-url
-        backend.ba = Arc::new({
-            let mut ba = (*ba).clone();
-            ba.with_option("uvx_args", "--index-url https://pypi.example.com/simple/");
-            ba
-        });
+        let backend = create_backend_with_opts(&[(
+            "uvx_args",
+            "--index-url https://pypi.example.com/simple/",
+        )]);
         assert!(backend.is_private_registry());
     }
 
     #[test]
     fn test_is_private_registry_with_keyring_provider() {
-        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
-        let mut backend = PIPXBackend {
-            ba: ba.clone(),
-            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
-        };
-
-        // Test with --keyring-provider
-        backend.ba = Arc::new({
-            let mut ba = (*ba).clone();
-            ba.with_option("pipx_args", "--keyring-provider subprocess");
-            ba
-        });
+        let backend = create_backend_with_opts(&[("pipx_args", "--keyring-provider subprocess")]);
         assert!(backend.is_private_registry());
     }
 
     #[test]
     fn test_is_private_registry_with_combined_args() {
-        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
-        let mut backend = PIPXBackend {
-            ba: ba.clone(),
-            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
-        };
-
-        // Test with combined authentication args
-        backend.ba = Arc::new({
-            let mut ba = (*ba).clone();
-            ba.with_option(
-                "uvx_args",
-                "--extra-index-url https://pypi.example.com/simple/ --keyring-provider subprocess",
-            );
-            ba
-        });
+        let backend = create_backend_with_opts(&[(
+            "uvx_args",
+            "--extra-index-url https://pypi.example.com/simple/ --keyring-provider subprocess",
+        )]);
         assert!(backend.is_private_registry());
     }
 
