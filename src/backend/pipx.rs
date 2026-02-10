@@ -840,3 +840,191 @@ fn fix_venv_python_symlink(install_path: &Path, pkg_name: &str) -> Result<()> {
 fn fix_venv_python_symlink(_install_path: &Path, _pkg_name: &str) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::args::BackendArg;
+
+    fn create_test_backend() -> PIPXBackend {
+        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
+        PIPXBackend {
+            ba,
+            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
+        }
+    }
+
+    #[test]
+    fn test_is_private_registry_with_extra_index_url() {
+        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
+        let mut backend = PIPXBackend {
+            ba: ba.clone(),
+            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
+        };
+
+        // Test with --extra-index-url
+        backend.ba = Arc::new({
+            let mut ba = (*ba).clone();
+            ba.with_option(
+                "uvx_args",
+                "--extra-index-url https://pypi.example.com/simple/",
+            );
+            ba
+        });
+        assert!(backend.is_private_registry());
+    }
+
+    #[test]
+    fn test_is_private_registry_with_index_url() {
+        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
+        let mut backend = PIPXBackend {
+            ba: ba.clone(),
+            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
+        };
+
+        // Test with --index-url
+        backend.ba = Arc::new({
+            let mut ba = (*ba).clone();
+            ba.with_option("uvx_args", "--index-url https://pypi.example.com/simple/");
+            ba
+        });
+        assert!(backend.is_private_registry());
+    }
+
+    #[test]
+    fn test_is_private_registry_with_keyring_provider() {
+        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
+        let mut backend = PIPXBackend {
+            ba: ba.clone(),
+            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
+        };
+
+        // Test with --keyring-provider
+        backend.ba = Arc::new({
+            let mut ba = (*ba).clone();
+            ba.with_option("pipx_args", "--keyring-provider subprocess");
+            ba
+        });
+        assert!(backend.is_private_registry());
+    }
+
+    #[test]
+    fn test_is_private_registry_with_combined_args() {
+        let ba = Arc::new(BackendArg::from_str("pipx:test-package").unwrap());
+        let mut backend = PIPXBackend {
+            ba: ba.clone(),
+            latest_version_cache: CacheManager::new(dirs::CACHE.join("test")),
+        };
+
+        // Test with combined authentication args
+        backend.ba = Arc::new({
+            let mut ba = (*ba).clone();
+            ba.with_option(
+                "uvx_args",
+                "--extra-index-url https://pypi.example.com/simple/ --keyring-provider subprocess",
+            );
+            ba
+        });
+        assert!(backend.is_private_registry());
+    }
+
+    #[test]
+    fn test_is_private_registry_without_auth() {
+        let backend = create_test_backend();
+        assert!(!backend.is_private_registry());
+    }
+
+    #[test]
+    fn test_parse_pip_index_output_single_line() {
+        let backend = create_test_backend();
+        let output = r#"WARNING: pip index is currently an experimental command...
+test-package (0.2.1)
+Available versions: 0.2.1, 0.2.0, 0.1.1, 0.1.0, 0.0.2
+INSTALLED: 0.2.1
+LATEST: 0.2.1"#;
+
+        let versions = backend.parse_pip_index_output(output).unwrap();
+        assert_eq!(versions.len(), 5);
+        assert_eq!(versions[0].version, "0.0.2");
+        assert_eq!(versions[1].version, "0.1.0");
+        assert_eq!(versions[2].version, "0.1.1");
+        assert_eq!(versions[3].version, "0.2.0");
+        assert_eq!(versions[4].version, "0.2.1");
+    }
+
+    #[test]
+    fn test_parse_pip_index_output_multi_line() {
+        let backend = create_test_backend();
+        let output = r#"WARNING: pip index is currently an experimental command...
+test-package (0.2.1)
+Available versions: 0.2.1, 0.2.0, 
+  0.1.1, 0.1.0, 
+  0.0.2
+INSTALLED: 0.2.1
+LATEST: 0.2.1"#;
+
+        let versions = backend.parse_pip_index_output(output).unwrap();
+        assert_eq!(versions.len(), 5);
+        assert_eq!(versions[0].version, "0.0.2");
+        assert_eq!(versions[4].version, "0.2.1");
+    }
+
+    #[test]
+    fn test_parse_pip_index_output_no_versions() {
+        let backend = create_test_backend();
+        let output = r#"WARNING: pip index is currently an experimental command...
+test-package (0.2.1)
+INSTALLED: 0.2.1
+LATEST: 0.2.1"#;
+
+        let result = backend.parse_pip_index_output(output);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No versions found")
+        );
+    }
+
+    #[test]
+    fn test_parse_pip_index_output_empty() {
+        let backend = create_test_backend();
+        let output = "";
+
+        let result = backend.parse_pip_index_output(output);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_pip_index_output_with_trailing_whitespace() {
+        let backend = create_test_backend();
+        let output = r#"test-package (0.2.1)
+Available versions: 0.2.1, 0.2.0,   
+  0.1.0  
+"#;
+
+        let versions = backend.parse_pip_index_output(output).unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].version, "0.1.0");
+        assert_eq!(versions[1].version, "0.2.0");
+        assert_eq!(versions[2].version, "0.2.1");
+    }
+
+    #[test]
+    fn test_parse_pip_index_output_version_sorting() {
+        let backend = create_test_backend();
+        let output = r#"test-package (1.0.0)
+Available versions: 1.0.0, 0.1.0, 2.0.0, 0.0.1, 1.5.0
+INSTALLED: 1.0.0"#;
+
+        let versions = backend.parse_pip_index_output(output).unwrap();
+        assert_eq!(versions.len(), 5);
+        // Should be sorted by semantic version
+        assert_eq!(versions[0].version, "0.0.1");
+        assert_eq!(versions[1].version, "0.1.0");
+        assert_eq!(versions[2].version, "1.0.0");
+        assert_eq!(versions[3].version, "1.5.0");
+        assert_eq!(versions[4].version, "2.0.0");
+    }
+}
