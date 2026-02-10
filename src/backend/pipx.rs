@@ -15,7 +15,7 @@ use crate::toolset::{ToolRequest, ToolVersion, ToolVersionOptions, Toolset, Tool
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
 use async_trait::async_trait;
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use regex::Regex;
@@ -59,6 +59,12 @@ impl Backend for PIPXBackend {
     async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         match self.tool_name().parse()? {
             PipxRequest::Pypi(package) => {
+                // For private registries, use pip index command with authentication args
+                if self.is_private_registry() {
+                    debug!("Using pip index for private registry package: {}", package);
+                    return self.list_versions_with_pip_index(&package, _config).await;
+                }
+
                 let registry_url = Self::get_registry_url()?;
                 if registry_url.contains("/json") {
                     debug!("Fetching JSON for {}", package);
@@ -139,6 +145,14 @@ impl Backend for PIPXBackend {
 
     async fn latest_stable_version(&self, config: &Arc<Config>) -> eyre::Result<Option<String>> {
         let this = self;
+
+        // For private registries, we can't fetch version info without auth
+        // Return None to indicate version is unknown, installation will proceed anyway
+        if this.is_private_registry() {
+            debug!("Skipping latest version lookup for private registry package");
+            return Ok(None);
+        }
+
         timeout::run_with_timeout_async(
             async || {
                 this.latest_version_cache
@@ -429,6 +443,193 @@ impl PIPXBackend {
 
     async fn uv_is_installed(&self, config: &Arc<Config>) -> bool {
         self.dependency_which(config, "uv").await.is_some()
+    }
+
+    /// Detect if this tool uses a private/custom registry based on its configuration.
+    ///
+    /// Private registries require authentication and can't be queried via HTTP without credentials.
+    /// This method checks for:
+    /// - Custom index URLs in tool options (--extra-index-url, --index-url)
+    /// - Keyring authentication providers (--keyring-provider)
+    /// - Non-default registry URLs in settings
+    ///
+    /// # Returns
+    /// `true` if the tool uses a private registry, `false` for public PyPI
+    fn is_private_registry(&self) -> bool {
+        let opts = self.ba.opts();
+
+        // Check for custom index URLs or keyring auth in uvx_args or pipx_args
+        let has_custom_index = opts
+            .get("uvx_args")
+            .or_else(|| opts.get("pipx_args"))
+            .is_some_and(|args| {
+                args.contains("--extra-index-url")
+                    || args.contains("--index-url")
+                    || args.contains("--keyring-provider")
+            });
+
+        // Check for custom registry URL setting (not the default PyPI)
+        let has_custom_registry = !Settings::get().pipx.registry_url.contains("pypi.org");
+
+        has_custom_index || has_custom_registry
+    }
+
+    /// List versions for private packages using `pip index versions` with authentication.
+    ///
+    /// This method queries package versions from private registries that require authentication.
+    /// It executes the `pip index versions` command with authentication parameters from tool options,
+    /// then parses the output to extract available versions.
+    ///
+    /// # Arguments
+    /// * `package` - The package name to query versions for
+    /// * `_config` - Configuration context (unused but kept for consistency)
+    ///
+    /// # Returns
+    /// A vector of `VersionInfo` containing available versions, sorted by version number.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - pip is not available in PATH
+    /// - Authentication fails
+    /// - The command times out
+    /// - Output parsing fails
+    ///
+    /// # Example
+    /// ```ignore
+    /// // With uvx_args = "--extra-index-url https://token@registry.com --keyring-provider subprocess"
+    /// let versions = backend.list_versions_with_pip_index("my-package", &config).await?;
+    /// ```
+    async fn list_versions_with_pip_index(
+        &self,
+        package: &str,
+        _config: &Arc<Config>,
+    ) -> eyre::Result<Vec<VersionInfo>> {
+        let opts = self.ba.opts();
+
+        // Parse authentication args from uvx_args or pipx_args
+        let auth_args = opts
+            .get("uvx_args")
+            .or_else(|| opts.get("pipx_args"))
+            .map(|s| shell_words::split(s))
+            .transpose()
+            .wrap_err("Failed to parse authentication arguments")?
+            .unwrap_or_default();
+
+        debug!(
+            "Querying versions for {} from private registry with {} auth args",
+            package,
+            auth_args.len()
+        );
+
+        // Clone values for the async closure
+        let package = package.to_string();
+        let auth_args = auth_args.clone();
+
+        // Execute pip index versions with timeout to prevent hanging
+        let stdout = timeout::run_with_timeout_async(
+            async move || {
+                // Build command: pip index versions <package> <auth_args...>
+                let mut cmd = CmdLineRunner::new("pip");
+                cmd = cmd.arg("index").arg("versions").arg(&package);
+
+                // Add authentication arguments (e.g., --extra-index-url, --keyring-provider)
+                for arg in &auth_args {
+                    cmd = cmd.arg(arg);
+                }
+
+                cmd.read().wrap_err_with(|| {
+                    format!(
+                        "Failed to execute pip index versions for {}. \
+                             Ensure pip is installed and accessible in PATH.",
+                        package
+                    )
+                })
+            },
+            Settings::get().fetch_remote_versions_timeout(),
+        )
+        .await?;
+
+        // Parse the output to extract versions
+        let versions = self
+            .parse_pip_index_output(&stdout)
+            .wrap_err_with(|| format!("Failed to parse pip index output for {}", package))?;
+
+        debug!("Found {} versions for {}", versions.len(), package);
+        Ok(versions)
+    }
+
+    /// Parse the output of `pip index versions` command.
+    ///
+    /// The `pip index versions` command outputs:
+    /// ```text
+    /// WARNING: pip index is currently an experimental command...
+    /// package-name (latest-version)
+    /// Available versions: v1, v2, v3, ...
+    /// INSTALLED: current-version
+    /// LATEST: latest-version
+    /// ```
+    ///
+    /// This method extracts all versions from the "Available versions:" line,
+    /// which may span multiple lines, and returns them sorted by version number.
+    ///
+    /// # Arguments
+    /// * `output` - The raw stdout from `pip index versions` command
+    ///
+    /// # Returns
+    /// A vector of `VersionInfo` sorted by semantic version
+    ///
+    /// # Errors
+    /// Returns an error if no versions are found in the output
+    fn parse_pip_index_output(&self, output: &str) -> eyre::Result<Vec<VersionInfo>> {
+        let mut versions = vec![];
+        let mut in_available_versions = false;
+        let mut versions_text = String::new();
+
+        for line in output.lines() {
+            let trimmed = line.trim();
+
+            // Start collecting versions after "Available versions:" line
+            if trimmed.starts_with("Available versions:") {
+                in_available_versions = true;
+                if let Some(versions_str) = trimmed.split(':').nth(1) {
+                    versions_text.push_str(versions_str);
+                }
+            } else if in_available_versions {
+                // Stop at lines that start with keywords, are empty, or start notices
+                if trimmed.starts_with("INSTALLED:")
+                    || trimmed.starts_with("LATEST:")
+                    || trimmed.is_empty()
+                    || trimmed.starts_with('[')
+                {
+                    break;
+                }
+                // Continue collecting version numbers (might span multiple lines)
+                versions_text.push_str(trimmed);
+            }
+        }
+
+        // Parse the collected version text
+        for version in versions_text.split(',') {
+            let version = version.trim().to_string();
+            if !version.is_empty() {
+                versions.push(VersionInfo {
+                    version,
+                    ..Default::default()
+                });
+            }
+        }
+
+        if versions.is_empty() {
+            bail!(
+                "No versions found in pip index output. \
+                 This may indicate authentication failure or package does not exist."
+            );
+        }
+
+        // Sort by version using semantic versioning
+        versions.sort_by_cached_key(|v| Versioning::new(&v.version));
+
+        Ok(versions)
     }
 }
 
