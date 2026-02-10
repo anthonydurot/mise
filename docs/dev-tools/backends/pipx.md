@@ -86,6 +86,71 @@ mise _should_ do this automatically when using `mise up python`.
 
 Other syntax may work but is unsupported and untested.
 
+## Private Package Registries
+
+mise supports installing Python packages from private registries such as Google Artifact Registry, Azure Artifacts, or AWS CodeArtifact. When you configure authentication for a private registry, mise automatically detects it and uses `pip index versions` to query available versions instead of PyPI.
+
+### Configuration
+
+Use `uvx_args` or `pipx_args` to pass authentication parameters:
+
+```toml
+[tools]
+"pipx:my-private-cli" = {
+  version = "latest",
+  uvx_args = "--extra-index-url https://oauth2accesstoken@europe-python.pkg.dev/my-project/python/simple/ --keyring-provider subprocess"
+}
+```
+
+### Authentication Methods
+
+#### Google Artifact Registry (OAuth2)
+
+```toml
+[tools]
+"pipx:my-tool" = {
+  version = "latest",
+  uvx_args = "--extra-index-url https://oauth2accesstoken@<region>-python.pkg.dev/<project>/<repo>/simple/ --keyring-provider subprocess"
+}
+```
+
+Make sure you have `gcloud` configured and the `keyring` package installed:
+
+```sh
+pip install keyring
+pip install keyrings.google-artifactregistry-auth
+gcloud auth application-default login
+```
+
+#### Azure Artifacts
+
+```toml
+[tools]
+"pipx:my-tool" = {
+  version = "latest",
+  uvx_args = "--extra-index-url https://<username>:<password>@pkgs.dev.azure.com/<org>/<project>/_packaging/<feed>/pypi/simple/"
+}
+```
+
+#### AWS CodeArtifact
+
+```toml
+[tools]
+"pipx:my-tool" = {
+  version = "latest",
+  uvx_args = "--index-url https://aws:<token>@<domain>-<account>.d.codeartifact.<region>.amazonaws.com/pypi/<repo>/simple/"
+}
+```
+
+### How It Works
+
+mise automatically detects private registries by checking for:
+- `--extra-index-url` or `--index-url` arguments
+- `--keyring-provider` authentication parameter
+- Non-default index URLs in Settings
+
+When detected, mise uses `pip index versions` with your authentication parameters to list available versions, bypassing the public PyPI API.
+
 ## Settings
 
 Set these with `mise settings set [VARIABLE] [VALUE]` or by setting the environment variable listed.

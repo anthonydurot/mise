@@ -863,11 +863,19 @@ mod tests {
             Some("pipx:test-package".to_string()),
             "test-package".to_string(),
             {
-                let mut map = BTreeMap::new();
+                let mut opts_map = IndexMap::new();
                 for (k, v) in opts {
-                    map.insert(k.to_string(), v.to_string());
+                    opts_map.insert(k.to_string(), v.to_string());
                 }
-                if map.is_empty() { None } else { Some(map) }
+                if opts_map.is_empty() {
+                    None
+                } else {
+                    Some(ToolVersionOptions {
+                        os: None,
+                        install_env: IndexMap::new(),
+                        opts: opts_map,
+                    })
+                }
             },
             BackendResolution::new(true),
         );
