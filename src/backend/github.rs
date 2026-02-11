@@ -49,6 +49,21 @@ enum VerificationStatus {
     Error(String),
 }
 
+/// Check if an SLSA verification error indicates a format/parsing issue rather than
+/// an actual verification failure. Some provenance files (e.g., BuildKit raw provenance)
+/// exist but aren't in a sigstore-verifiable format.
+fn is_slsa_format_issue(e: &sigstore_verification::AttestationError) -> bool {
+    match e {
+        sigstore_verification::AttestationError::NoAttestations => true,
+        sigstore_verification::AttestationError::Verification(msg) => {
+            msg.contains("does not contain valid attestations")
+                || msg.contains("No certificate found")
+                || msg.contains("neither DSSE envelope nor message signature")
+        }
+        _ => false,
+    }
+}
+
 /// Returns install-time-only option keys for GitHub/GitLab backend.
 pub fn install_time_option_keys() -> Vec<String> {
     vec![
@@ -139,10 +154,13 @@ impl Backend for UnifiedGitBackend {
         features
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         let repo = self.ba.tool_name();
         let id = self.ba.to_string();
-        let opts = self.ba.opts();
+        let opts = config
+            .get_tool_opts(&self.ba)
+            .await?
+            .unwrap_or_else(|| self.ba.opts());
         let api_url = self.get_api_url(&opts);
         let version_prefix = opts.get("version_prefix");
 
@@ -178,7 +196,7 @@ impl Backend for UnifiedGitBackend {
                 .into_iter()
                 .filter(|r| version_prefix.is_none_or(|p| r.tag_name.starts_with(p)))
                 .map(|r| VersionInfo {
-                    version: self.strip_version_prefix(&r.tag_name),
+                    version: self.strip_version_prefix(&r.tag_name, &opts),
                     created_at: r.released_at,
                     release_url: Some(format!("{}/-/releases/{}", web_url_base, r.tag_name)),
                     ..Default::default()
@@ -190,7 +208,7 @@ impl Backend for UnifiedGitBackend {
                 .into_iter()
                 .filter(|r| version_prefix.is_none_or(|p| r.tag_name.starts_with(p)))
                 .map(|r| VersionInfo {
-                    version: self.strip_version_prefix(&r.tag_name),
+                    version: self.strip_version_prefix(&r.tag_name, &opts),
                     created_at: Some(r.created_at),
                     release_url: Some(format!("{}/releases/tag/{}", web_url_base, r.tag_name)),
                     ..Default::default()
@@ -202,7 +220,7 @@ impl Backend for UnifiedGitBackend {
                 .into_iter()
                 .filter(|r| version_prefix.is_none_or(|p| r.tag_name.starts_with(p)))
                 .map(|r| VersionInfo {
-                    version: self.strip_version_prefix(&r.tag_name),
+                    version: self.strip_version_prefix(&r.tag_name, &opts),
                     created_at: Some(r.created_at),
                     release_url: Some(format!("{}/releases/tag/{}", web_url_base, r.tag_name)),
                     ..Default::default()
@@ -232,7 +250,11 @@ impl Backend for UnifiedGitBackend {
         mut tv: ToolVersion,
     ) -> Result<ToolVersion> {
         let repo = self.repo();
-        let opts = tv.request.options();
+        let opts = ctx
+            .config
+            .get_tool_opts(&self.ba)
+            .await?
+            .unwrap_or_else(|| tv.request.options());
         let api_url = self.get_api_url(&opts);
 
         // Check if URL already exists in lockfile platforms first
@@ -921,9 +943,7 @@ impl UnifiedGitBackend {
         }
     }
 
-    fn strip_version_prefix(&self, tag_name: &str) -> String {
-        let opts = self.ba.opts();
-
+    fn strip_version_prefix(&self, tag_name: &str, opts: &ToolVersionOptions) -> String {
         // If a custom version_prefix is configured, strip it first
         if let Some(prefix) = opts.get("version_prefix")
             && let Some(stripped) = tag_name.strip_prefix(prefix)
@@ -1243,7 +1263,14 @@ impl UnifiedGitBackend {
                 }
                 Ok(verified)
             }
-            Err(e) => Err(VerificationStatus::Error(e.to_string())),
+            Err(e) => {
+                if is_slsa_format_issue(&e) {
+                    debug!("SLSA provenance file not in verifiable format for {tv}: {e}");
+                    Err(VerificationStatus::NoAttestations)
+                } else {
+                    Err(VerificationStatus::Error(e.to_string()))
+                }
+            }
         }
     }
 }
@@ -1339,7 +1366,7 @@ fn template_string_for_target(template: &str, tv: &ToolVersion, target: &Platfor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::args::{BackendArg, BackendResolution};
+    use crate::cli::args::BackendArg;
 
     fn create_test_backend() -> UnifiedGitBackend {
         UnifiedGitBackend::from_arg(BackendArg::new(
@@ -1357,41 +1384,56 @@ mod tests {
 
     #[test]
     fn test_version_prefix_functionality() {
-        let mut backend = create_test_backend();
+        let backend = create_test_backend();
+        let default_opts = ToolVersionOptions::default();
 
         // Test with no version prefix configured
-        assert_eq!(backend.strip_version_prefix("v1.0.0"), "1.0.0");
-        assert_eq!(backend.strip_version_prefix("1.0.0"), "1.0.0");
+        assert_eq!(
+            backend.strip_version_prefix("v1.0.0", &default_opts),
+            "1.0.0"
+        );
+        assert_eq!(
+            backend.strip_version_prefix("1.0.0", &default_opts),
+            "1.0.0"
+        );
 
         // Test projectname@version format - only strips if prefix matches repo name
         // Backend uses "github:test/repo" so repo short name is "repo", full name is "test/repo"
-        assert_eq!(backend.strip_version_prefix("repo@0.15.0"), "0.15.0");
-        assert_eq!(backend.strip_version_prefix("repo@1.2.3"), "1.2.3");
+        assert_eq!(
+            backend.strip_version_prefix("repo@0.15.0", &default_opts),
+            "0.15.0"
+        );
+        assert_eq!(
+            backend.strip_version_prefix("repo@1.2.3", &default_opts),
+            "1.2.3"
+        );
         // Also accepts full repo name as prefix
-        assert_eq!(backend.strip_version_prefix("test/repo@2.0.0"), "2.0.0");
+        assert_eq!(
+            backend.strip_version_prefix("test/repo@2.0.0", &default_opts),
+            "2.0.0"
+        );
         // Should NOT strip if prefix doesn't match repo name (prevents listing
         // versions that can't be installed)
         assert_eq!(
-            backend.strip_version_prefix("other_package@0.15.0"),
+            backend.strip_version_prefix("other_package@0.15.0", &default_opts),
             "other_package@0.15.0"
         );
         // Should not match if part after @ doesn't start with a digit
-        assert_eq!(backend.strip_version_prefix("repo@beta"), "repo@beta");
+        assert_eq!(
+            backend.strip_version_prefix("repo@beta", &default_opts),
+            "repo@beta"
+        );
 
         // Test with custom version prefix
         let mut opts = ToolVersionOptions::default();
         opts.opts
             .insert("version_prefix".to_string(), "release-".to_string());
-        backend.ba = Arc::new(BackendArg::new_raw(
-            "test".to_string(),
-            Some("github:test/repo".to_string()),
-            "test".to_string(),
-            Some(opts),
-            BackendResolution::new(true),
-        ));
 
-        assert_eq!(backend.strip_version_prefix("release-1.0.0"), "1.0.0");
-        assert_eq!(backend.strip_version_prefix("1.0.0"), "1.0.0");
+        assert_eq!(
+            backend.strip_version_prefix("release-1.0.0", &opts),
+            "1.0.0"
+        );
+        assert_eq!(backend.strip_version_prefix("1.0.0", &opts), "1.0.0");
     }
 
     #[test]
@@ -1445,5 +1487,60 @@ mod tests {
         let result =
             backend.find_asset_case_insensitive(&assets, "nonexistent-asset.tar.gz", |a| &a.name);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_no_attestations() {
+        let err = sigstore_verification::AttestationError::NoAttestations;
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_invalid_format() {
+        // This is the exact error from BuildKit raw provenance files parsed line-by-line
+        let err = sigstore_verification::AttestationError::Verification(
+            "File does not contain valid attestations or SLSA provenance".to_string(),
+        );
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_no_certificate() {
+        let err = sigstore_verification::AttestationError::Verification(
+            "No certificate found in attestation bundle".to_string(),
+        );
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_no_dsse_envelope() {
+        let err = sigstore_verification::AttestationError::Verification(
+            "Bundle has neither DSSE envelope nor message signature".to_string(),
+        );
+        assert!(is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_real_verification_failure() {
+        // Digest mismatch = real verification failure, NOT a format issue
+        let err = sigstore_verification::AttestationError::Verification(
+            "Artifact digest mismatch: expected abc123".to_string(),
+        );
+        assert!(!is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_signature_failure() {
+        // Signature verification failure = real failure, NOT a format issue
+        let err = sigstore_verification::AttestationError::Verification(
+            "P-256 signature verification failed: invalid signature".to_string(),
+        );
+        assert!(!is_slsa_format_issue(&err));
+    }
+
+    #[test]
+    fn test_is_slsa_format_issue_api_error() {
+        let err = sigstore_verification::AttestationError::Api("connection refused".to_string());
+        assert!(!is_slsa_format_issue(&err));
     }
 }
